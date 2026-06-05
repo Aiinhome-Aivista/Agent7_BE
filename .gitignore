@@ -1,0 +1,13 @@
+__pycache__
+venv
+*.pyc
+*.pyo
+.env
+.DS_Store
+.idea
+.vscode
+chroma_db
+logs
+uploads/policies/
+uploads/
+uploads/graphs/
