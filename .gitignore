@@ -6,7 +6,7 @@ venv
 .DS_Store
 .idea
 .vscode
-chroma_db
+chroma_db/
 logs
 uploads/policies/
 uploads/
