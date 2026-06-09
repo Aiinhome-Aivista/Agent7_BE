@@ -735,6 +735,8 @@ async def upload_more_documents(
     saved_paths = []
     combined_text = ""
     saved_files_info = []
+    has_images = False
+    image_contents = []
 
     for f in uploaded_files:
         ext = os.path.splitext(f.filename)[1].lower() or ".pdf"
@@ -747,9 +749,17 @@ async def upload_more_documents(
             out.write(content)
         saved_paths.append(fpath)
 
-        raw_text = _extract_text(fpath, ext)
-        if not raw_text:
-            raw_text = content.decode("utf-8", errors="ignore")
+        raw_text = ""
+        if ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
+            has_images = True
+            import base64
+            img_b64 = base64.b64encode(content).decode("utf-8")
+            mime_type = "image/png" if ext == ".png" else "image/jpeg"
+            image_contents.append((f.filename, img_b64, mime_type))
+        else:
+            raw_text = _extract_text(fpath, ext)
+            if not raw_text:
+                raw_text = content.decode("utf-8", errors="ignore")
 
         saved_files_info.append({
             "filename": f.filename,
@@ -757,44 +767,118 @@ async def upload_more_documents(
             "ext": ext,
             "raw_text": raw_text
         })
-        combined_text += f"\n--- DOCUMENT: {f.filename} ---\n{raw_text}\n"
+        if raw_text:
+            combined_text += f"\n--- DOCUMENT: {f.filename} ---\n{raw_text}\n"
 
     # Classify files category
     categories_by_filename = {}
+    transcriptions_by_filename = {}
+    extracted_data_by_filename = {}
+
     if settings.MISTRAL_API_KEY:
-        prompt = """You are a Claims intake helper. Given list of filenames and their snippets, classify each file into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
-        Return JSON object with "documents": [{"filename": "...", "category": "..."}]"""
-        try:
-            truncated = combined_text[:4000]
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "https://api.mistral.ai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.MISTRAL_API_KEY.strip()}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "mistral-small-latest",
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": prompt},
-                            {"role": "user", "content": truncated},
-                        ],
-                    },
-                )
-                if resp.status_code == 200:
-                    res_json = resp.json()
-                    docs_extracted = json.loads(res_json["choices"][0]["message"]["content"]).get("documents", [])
-                    for d in docs_extracted:
-                        categories_by_filename[d["filename"].lower()] = d.get("category", "other")
-        except Exception:
-            pass
+        if has_images:
+            prompt = """You are a Claims intake helper. Given document images and text snippets:
+            1. Classify each file into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
+            2. For each document, transcribe all readable text (especially if it was an image) and place it in the "transcribed_text" field.
+            3. Extract key structured metadata (e.g. name, date_of_birth, patient_name, dob, validity, expiry_date) and place it in "extracted_data".
+            Return ONLY a valid JSON object matching this schema exactly:
+            {
+              "documents": [
+                {
+                  "filename": "<filename>",
+                  "category": "claim_form | medical_report | test_report | id_card | other",
+                  "transcribed_text": "...",
+                  "extracted_data": {
+                     // Key-value pairs
+                  }
+                }
+              ]
+            }"""
+            user_content = [
+                {
+                    "type": "text",
+                    "text": f"Please classify and transcribe the uploaded documents. Text extracted from PDFs/files:\n{combined_text[:60000]}"
+                }
+            ]
+            for filename, img_b64, mime in image_contents:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{img_b64}"
+                    }
+                })
+
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        "https://api.mistral.ai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.MISTRAL_API_KEY.strip()}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "pixtral-12b-latest",
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": prompt},
+                                {"role": "user", "content": user_content},
+                            ],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        docs_extracted = json.loads(res_json["choices"][0]["message"]["content"]).get("documents", [])
+                        for d in docs_extracted:
+                            fname_lower = d["filename"].lower()
+                            categories_by_filename[fname_lower] = d.get("category", "other")
+                            transcriptions_by_filename[fname_lower] = d.get("transcribed_text", "")
+                            extracted_data_by_filename[fname_lower] = d.get("extracted_data", {})
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Image classification failed: {e}")
+        else:
+            prompt = """You are a Claims intake helper. Given list of filenames and their snippets, classify each file into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
+            Return JSON object with "documents": [{"filename": "...", "category": "..."}]"""
+            try:
+                truncated = combined_text[:4000]
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "https://api.mistral.ai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.MISTRAL_API_KEY.strip()}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "mistral-small-latest",
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": prompt},
+                                {"role": "user", "content": truncated},
+                            ],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        docs_extracted = json.loads(res_json["choices"][0]["message"]["content"]).get("documents", [])
+                        for d in docs_extracted:
+                            categories_by_filename[d["filename"].lower()] = d.get("category", "other")
+            except Exception:
+                pass
 
     # Save to ClaimDocument DB
     for info in saved_files_info:
-        cat = categories_by_filename.get(info["filename"].lower(), "other")
+        fname_lower = info["filename"].lower()
+        cat = categories_by_filename.get(fname_lower, "other")
+        
+        # Heuristic override if classified incorrectly but filename contains obvious keywords
+        if "id_card" in fname_lower or "aadhaar" in fname_lower or "pan_card" in fname_lower or "identity" in fname_lower or "passport" in fname_lower:
+            cat = "id_card"
+
         if cat not in ("claim_form", "medical_report", "test_report", "id_card", "other"):
             cat = "other"
+
+        transcribed_text = transcriptions_by_filename.get(fname_lower, "")
+        ext_data = extracted_data_by_filename.get(fname_lower, {})
 
         claim_doc = ClaimDocument(
             claim_id=claim.id,
@@ -803,8 +887,8 @@ async def upload_more_documents(
             filename=info["filename"],
             file_path=info["fpath"],
             category=cat,
-            raw_text=info["raw_text"],
-            extracted_data={}
+            raw_text=transcribed_text or info["raw_text"],
+            extracted_data=ext_data
         )
         db.add(claim_doc)
         db.flush()
@@ -813,14 +897,26 @@ async def upload_more_documents(
             verification_result = verify_identity_document(db, claim_doc, claim.policy_id, current_user.id)
             claim_doc.extracted_data = verification_result
 
-    # Revert back status or fallback
-    back_status = claim.status_before_doc_request or "escalated_adjuster"
-    if back_status in ("documents_required", "fnol_received", "settled", "rejected", "closed"):
-        back_status = "escalated_adjuster"
-
-    claim.status = back_status
+    # Re-run pipeline to update fraud score and trace
+    from app.agents import a1_orchestrator
+    from app.models.models import PipelineTrace
+    
     claim.status_before_doc_request = None
     claim.document_request_message = None
+    db.flush()
+
+    fnol_payload = {"input_type": "form"}
+    result = a1_orchestrator.run_pipeline(db, claim, fnol_payload)
+
+    trace_rec = db.query(PipelineTrace).filter(PipelineTrace.claim_id == claim.id).first()
+    if not trace_rec:
+        trace_rec = PipelineTrace(claim_id=claim.id)
+        db.add(trace_rec)
+    trace_rec.outcome = result["outcome"]
+    trace_rec.outcome_msg = result["outcome_msg"]
+    trace_rec.elapsed_ms = result["elapsed_ms"]
+    trace_rec.trace = result["pipeline_trace"]
+    trace_rec.ran_at = datetime.utcnow()
 
     db.commit()
     db.refresh(claim)
