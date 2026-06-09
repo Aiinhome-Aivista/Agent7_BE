@@ -93,6 +93,120 @@ def _next_bday(dt: datetime, n: int) -> datetime:
     return d
 
 
+def verify_identity_document(db: Session, doc: ClaimDocument, policy_id: int, user_id: int) -> dict:
+    """
+    Performs identity verification for a ClaimDocument of category 'id_card'.
+    Looks up Policy/User details and matches Name, DOB, and checks for expiry.
+    """
+    policy = db.query(Policy).filter(Policy.id == policy_id).first()
+    if not policy:
+        return {"id_verified": False, "reasons": ["Policy not found"]}
+
+    ext_data = doc.extracted_data or {}
+    
+    extracted_name = ext_data.get("patient_name") or ext_data.get("name") or ext_data.get("full_name") or ext_data.get("insured_name")
+    extracted_dob = ext_data.get("date_of_birth") or ext_data.get("dob")
+    extracted_expiry = ext_data.get("expiry_date") or ext_data.get("valid_till") or ext_data.get("expiry")
+
+    if (not extracted_name or not extracted_dob) and doc.raw_text:
+        from app.core.config import settings
+        import httpx
+        import json
+        if settings.MISTRAL_API_KEY:
+            prompt = """You are an Identity Proof Parser. Extract the following fields from the text of this identity card:
+            1. full_name (Full Name of the cardholder)
+            2. dob (Date of birth in YYYY-MM-DD format)
+            3. expiry_date (Expiry date of the card in YYYY-MM-DD format, if applicable)
+            Return ONLY a valid JSON object: {"full_name": "...", "dob": "...", "expiry_date": "..."}"""
+            try:
+                with httpx.Client(timeout=15.0) as client:
+                    resp = client.post(
+                        "https://api.mistral.ai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.MISTRAL_API_KEY.strip()}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "mistral-small-latest",
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": prompt},
+                                {"role": "user", "content": doc.raw_text[:4000]},
+                            ],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
+                        extracted_name = parsed.get("full_name") or extracted_name
+                        extracted_dob = parsed.get("dob") or extracted_dob
+                        extracted_expiry = parsed.get("expiry_date") or extracted_expiry
+            except Exception:
+                pass
+
+    if not extracted_name and doc.raw_text:
+        import re
+        name_match = re.search(r"Name[.:\s]+([A-Za-z\s]{3,40})", doc.raw_text, re.IGNORECASE)
+        if name_match:
+            extracted_name = name_match.group(1).strip()
+    
+    if not extracted_dob and doc.raw_text:
+        from app.controllers.policy_controller import _find_date
+        extracted_dob = _find_date([
+            r"(?:date\s+of\s+birth|dob|d\.o\.b)[.:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s+\w+\s+\d{4})",
+            r"born(?:\s+on)?[.:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+        ], doc.raw_text)
+
+    if extracted_dob:
+        from app.controllers.policy_controller import _normalize_date_str
+        extracted_dob = _normalize_date_str(extracted_dob)
+
+    if extracted_expiry:
+        from app.controllers.policy_controller import _normalize_date_str
+        extracted_expiry = _normalize_date_str(extracted_expiry)
+
+    reasons = []
+    id_verified = True
+
+    policy_name = policy.policyholder_name or ""
+    if extracted_name and policy_name:
+        from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, extracted_name.lower().strip(), policy_name.lower().strip()).ratio()
+        if ratio < 0.75:
+            id_verified = False
+            reasons.append(f"Name mismatch: ID Card says '{extracted_name}' but Policyholder name is '{policy_name}' (Match: {int(ratio*100)}%)")
+    else:
+        id_verified = False
+        reasons.append("Could not extract/verify Name from ID card.")
+
+    if extracted_dob and policy.date_of_birth:
+        p_dob = str(policy.date_of_birth)
+        if extracted_dob != p_dob:
+            id_verified = False
+            reasons.append(f"DOB mismatch: ID Card DOB is '{extracted_dob}' but Policyholder DOB is '{p_dob}'")
+    elif not policy.date_of_birth:
+        pass
+    else:
+        id_verified = False
+        reasons.append("Could not extract/verify Date of Birth from ID card.")
+
+    if extracted_expiry:
+        try:
+            exp_date = datetime.strptime(extracted_expiry, "%Y-%m-%d").date()
+            if exp_date < date.today():
+                id_verified = False
+                reasons.append(f"ID Card is expired: Expiry date was '{extracted_expiry}'")
+        except Exception:
+            pass
+
+    return {
+        "id_verified": id_verified,
+        "reasons": reasons,
+        "extracted_name": extracted_name,
+        "extracted_dob": extracted_dob,
+        "extracted_expiry": extracted_expiry
+    }
+
+
 # ── Routes ────────────────────────────────────────────────────
 @router.get("/", response_model=List[ClaimOut])
 def list_claims(
@@ -693,6 +807,11 @@ async def upload_more_documents(
             extracted_data={}
         )
         db.add(claim_doc)
+        db.flush()
+
+        if cat == "id_card":
+            verification_result = verify_identity_document(db, claim_doc, claim.policy_id, current_user.id)
+            claim_doc.extracted_data = verification_result
 
     # Revert back status or fallback
     back_status = claim.status_before_doc_request or "escalated_adjuster"

@@ -32,6 +32,7 @@ from app.controllers.auth_controller import get_current_user, User
 from app.agents import a1_orchestrator
 from app.core.config import settings
 from app.controllers.policy_controller import _extract_text
+from app.controllers.claims_controller import verify_identity_document
 
 router = APIRouter(prefix="/fnol", tags=["FNOL & Pipeline"])
 
@@ -554,6 +555,11 @@ Rules:
                     extracted_data=ext_data
                 )
                 db.add(claim_doc)
+                db.flush()
+
+                if category == "id_card":
+                    verification_result = verify_identity_document(db, claim_doc, policy_id, current_user.id)
+                    claim_doc.extracted_data = verification_result
 
         # Log any leftover files
         for info in saved_files_info:

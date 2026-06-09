@@ -49,10 +49,50 @@ def run(db: Session, claim: Claim, coverage_result: dict, damage_result: dict) -
         red_flags.append("theft_claim")
         score += 0.10
 
-    # Rule 7: Multiple claim types pattern (stub — check by claim_id parity)
-    if claim.id % 7 == 0:
-        red_flags.append("repeated_claim_pattern")
-        score += 0.20
+    # Rule 7: Repeated/High-frequency claim pattern check
+    from app.models.models import Claim as DBClaim
+    from datetime import timedelta
+    
+    one_year_ago = datetime.utcnow() - timedelta(days=365)
+    past_claims_1yr = db.query(DBClaim).filter(
+        DBClaim.claimant_id == claim.claimant_id,
+        DBClaim.created_at >= one_year_ago,
+        DBClaim.id != claim.id
+    ).count()
+
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    past_claims_30d = db.query(DBClaim).filter(
+        DBClaim.claimant_id == claim.claimant_id,
+        DBClaim.created_at >= thirty_days_ago,
+        DBClaim.id != claim.id
+    ).count()
+
+    if past_claims_30d >= 1:
+        red_flags.append("claims_frequency_high_30d")
+        score += 0.25
+    elif past_claims_1yr >= 3:
+        red_flags.append("claims_frequency_high_1yr")
+        score += 0.15
+
+    # Rule 8: Identity proof mismatch/verification failed check
+    from app.models.models import ClaimDocument
+    id_docs = db.query(ClaimDocument).filter(
+        ClaimDocument.claim_id == claim.id,
+        ClaimDocument.category == "id_card"
+    ).all()
+    
+    id_verified_flag = True
+    has_id_doc = False
+
+    for doc in id_docs:
+        has_id_doc = True
+        ext_data = doc.extracted_data or {}
+        if ext_data and not ext_data.get("id_verified", True):
+            id_verified_flag = False
+
+    if has_id_doc and not id_verified_flag:
+        red_flags.append("identity_verification_failed")
+        score += 0.30
 
     score = min(score, 1.0)
 

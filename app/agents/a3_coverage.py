@@ -36,7 +36,8 @@ def run(db: Session, claim: Claim) -> dict:
     from app.models.models import Settlement
     total_settled = db.query(func.sum(Settlement.net_payout)).join(Claim, Claim.id == Settlement.claim_id).filter(
         Claim.policy_id == policy.id,
-        Claim.status == "settled"
+        Claim.status == "settled",
+        Claim.id != claim.id
     ).scalar() or 0.0
     total_settled = float(total_settled)
     remaining_capacity = float(policy.coverage_limit or 0) - total_settled

@@ -1508,6 +1508,39 @@ def get_policy_document(
     )
 
 
+# ── Get policy claims ──────────────────────────────────────────
+@router.get("/{policy_id}/claims", summary="Get all claims for a policy")
+def get_policy_claims(
+    policy_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    p = db.query(Policy).filter(Policy.id == policy_id).first()
+    if not p:
+        raise HTTPException(404, "Policy not found")
+    # If the user is a policyholder, they must own the policy
+    if user.role == "policyholder" and p.policyholder_id != user.id:
+        raise HTTPException(403, "Access denied")
+    
+    claims = db.query(Claim).filter(Claim.policy_id == policy_id).all()
+    
+    from app.models.models import Settlement
+    result = []
+    for c in claims:
+        settlement = db.query(Settlement).filter(Settlement.claim_id == c.id).first()
+        payout = float(settlement.net_payout) if settlement else 0.0
+        result.append({
+            "id": c.id,
+            "claim_number": c.claim_number,
+            "claim_type": c.claim_type,
+            "status": c.status,
+            "incident_date": str(c.incident_date),
+            "created_at": str(c.created_at) if c.created_at else None,
+            "settled_amount": payout
+        })
+    return result
+
+
 # ── Delete policy ──────────────────────────────────────────────
 @router.delete("/{policy_id}", summary="Remove a policy")
 def delete_policy(policy_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
