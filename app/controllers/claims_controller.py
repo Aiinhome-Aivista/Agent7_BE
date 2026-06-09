@@ -38,6 +38,7 @@ class ClaimOut(BaseModel):
     document_request_message: str | None = None
     document_request_by_role: str | None = None
     status_before_doc_request: str | None = None
+    document_request_history: List[dict] | None = None
 
     class Config:
         from_attributes = True
@@ -230,6 +231,94 @@ def list_claims(
         q = q.filter(Claim.status == status)
     return q.offset(offset).limit(limit).all()
 
+def _prepare_claim_out(db: Session, claim: Claim) -> ClaimOut:
+    fnol = db.query(FNOLSubmission).filter(FNOLSubmission.claim_id == claim.id).first()
+    doc_url = None
+    if fnol and fnol.raw_input_path and os.path.exists(fnol.raw_input_path):
+        doc_url = f"/api/claims/{claim.id}/document"
+        
+    policy = db.query(Policy).filter(Policy.id == claim.policy_id).first()
+    coverage_limit = float(policy.coverage_limit or 0) if policy else 0.0
+    
+    from sqlalchemy import func
+    from app.models.models import Settlement, EmailLog, ClaimDocument
+    import re
+    
+    total_settled = db.query(func.sum(Settlement.net_payout)).join(Claim, Claim.id == Settlement.claim_id).filter(
+        Claim.policy_id == claim.policy_id,
+        Claim.status == "settled"
+    ).scalar() or 0.0
+    total_settled = float(total_settled)
+    remaining_capacity = max(0.0, coverage_limit - total_settled)
+    
+    # Document request history
+    email_logs = db.query(EmailLog).filter(
+        EmailLog.claim_id == claim.id,
+        EmailLog.event_type.like("document_request_%")
+    ).order_by(EmailLog.created_at.asc()).all()
+
+    claim_created = claim.created_at or datetime.min
+    claim_docs = db.query(ClaimDocument).filter(
+        ClaimDocument.claim_id == claim.id,
+        ClaimDocument.created_at > claim_created + timedelta(seconds=5)
+    ).order_by(ClaimDocument.created_at.asc()).all()
+
+    # Group documents by minute to identify batch uploads
+    grouped_submissions = {}
+    for doc in claim_docs:
+        minute_key = doc.created_at.strftime("%Y-%m-%d %H:%M")
+        if minute_key not in grouped_submissions:
+            grouped_submissions[minute_key] = {
+                "date": doc.created_at,
+                "filenames": [],
+            }
+        grouped_submissions[minute_key]["filenames"].append(doc.filename)
+
+    history = []
+    # Add requests to history
+    for idx, log in enumerate(email_logs):
+        # Extract cleaner request message
+        match = re.search(r'Request Details:\s*\n?\s*"(.*?)"', log.body, re.DOTALL)
+        msg = match.group(1) if match else log.body
+        
+        by_role = log.source_role or "adjuster"
+        if by_role == "system":
+            if claim.status in ("escalated_siu", "siu_escalation_limit_exceeded") or claim.assigned_siu is not None:
+                by_role = "siu_investigator"
+            else:
+                by_role = "adjuster"
+
+        history.append({
+            "type": "request",
+            "sequence": idx + 1,
+            "date": log.created_at.isoformat() if log.created_at else None,
+            "message": msg,
+            "by": by_role
+        })
+
+    # Add submissions to history
+    for idx, (min_key, sub) in enumerate(sorted(grouped_submissions.items(), key=lambda x: x[0])):
+        history.append({
+            "type": "submission",
+            "sequence": idx + 1,
+            "date": sub["date"].isoformat() if sub["date"] else None,
+            "message": ", ".join(sub["filenames"]),
+            "by": "Policyholder"
+        })
+
+    # Sort the combined history chronologically
+    history.sort(key=lambda x: x["date"] or "")
+
+    # Build response
+    out = ClaimOut.model_validate(claim)
+    out.incident_description = claim.incident_description
+    out.document_url = doc_url
+    out.policy_coverage_limit = coverage_limit
+    out.policy_total_settled_amount = total_settled
+    out.policy_remaining_capacity = remaining_capacity
+    out.document_request_history = history
+    return out
+
 
 @router.get("/{claim_id}", response_model=ClaimOut)
 def get_claim(
@@ -240,32 +329,8 @@ def get_claim(
     claim = db.query(Claim).filter(Claim.id == claim_id).first()
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
-    # Attach document_url if an FNOL submission with a file exists
-    fnol = db.query(FNOLSubmission).filter(FNOLSubmission.claim_id == claim_id).first()
-    doc_url = None
-    if fnol and fnol.raw_input_path and os.path.exists(fnol.raw_input_path):
-        doc_url = f"/api/claims/{claim_id}/document"
-        
-    policy = db.query(Policy).filter(Policy.id == claim.policy_id).first()
-    coverage_limit = float(policy.coverage_limit or 0) if policy else 0.0
-    
-    from sqlalchemy import func
-    from app.models.models import Settlement
-    total_settled = db.query(func.sum(Settlement.net_payout)).join(Claim, Claim.id == Settlement.claim_id).filter(
-        Claim.policy_id == claim.policy_id,
-        Claim.status == "settled"
-    ).scalar() or 0.0
-    total_settled = float(total_settled)
-    remaining_capacity = max(0.0, coverage_limit - total_settled)
-    
-    # Build response manually to include extra fields
-    out = ClaimOut.model_validate(claim)
-    out.incident_description = claim.incident_description
-    out.document_url = doc_url
-    out.policy_coverage_limit = coverage_limit
-    out.policy_total_settled_amount = total_settled
-    out.policy_remaining_capacity = remaining_capacity
-    return out
+    return _prepare_claim_out(db, claim)
+
 
 
 @router.post("/{claim_id}/decision", response_model=ClaimDecisionOut)
@@ -666,7 +731,7 @@ def request_more_documents(
         notify_claim_escalation(db, claim)
 
         db.commit()
-        return claim
+        return _prepare_claim_out(db, claim)
 
     claim.status_before_doc_request = claim.status
     claim.status = "documents_required"
@@ -690,11 +755,12 @@ def request_more_documents(
         ),
         event_type=f"document_request_{claim.document_request_count}",
         source_status="documents_required",
-        trigger_reason=payload.message
+        trigger_reason=payload.message,
+        source_role=current_user.role,
     )
 
     db.commit()
-    return claim
+    return _prepare_claim_out(db, claim)
 
 
 @router.post("/{claim_id}/upload-more-documents", response_model=ClaimOut)
@@ -920,4 +986,4 @@ async def upload_more_documents(
 
     db.commit()
     db.refresh(claim)
-    return claim
+    return _prepare_claim_out(db, claim)

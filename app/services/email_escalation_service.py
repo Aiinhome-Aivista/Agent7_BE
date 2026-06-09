@@ -357,6 +357,7 @@ def notify_claimant_update(
     event_type: str,
     source_status: Optional[str] = None,
     trigger_reason: Optional[str] = None,
+    source_role: Optional[str] = "system",
 ) -> Optional[EmailLog]:
     config = get_or_create_email_config(db)
     recipient = _claimant_recipient(db, claim)
@@ -370,7 +371,7 @@ def notify_claimant_update(
             email_config_id=config.id,
             event_type=event_type,
             source_status=source_status or claim.status,
-            source_role="system",
+            source_role=source_role,
             recipient_user_id=recipient.id if recipient else None,
             recipient_name=recipient.full_name if recipient else None,
             recipient_role="policyholder",
@@ -410,7 +411,7 @@ def notify_claimant_update(
         email_config_id=config.id,
         event_type=event_type,
         source_status=source_status or claim.status,
-        source_role="system",
+        source_role=source_role,
         recipient_user_id=recipient.id,
         recipient_name=recipient.full_name,
         recipient_role="policyholder",
