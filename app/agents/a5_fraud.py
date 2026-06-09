@@ -79,14 +79,15 @@ def run(db: Session, claim: Claim, coverage_result: dict, damage_result: dict) -
     id_docs = db.query(ClaimDocument).filter(
         ClaimDocument.claim_id == claim.id,
         ClaimDocument.category == "id_card"
-    ).all()
+    ).order_by(ClaimDocument.id.desc()).all()
     
     id_verified_flag = True
     has_id_doc = False
 
-    for doc in id_docs:
+    if id_docs:
         has_id_doc = True
-        ext_data = doc.extracted_data or {}
+        latest_doc = id_docs[0]
+        ext_data = latest_doc.extracted_data or {}
         if ext_data and not ext_data.get("id_verified", True):
             id_verified_flag = False
 
@@ -124,6 +125,11 @@ def run(db: Session, claim: Claim, coverage_result: dict, damage_result: dict) -
     ratio_reduction = (score * 0.5) + (len(red_flags) * 0.05)
     final_ratio = max(0.10, base_ratio - ratio_reduction)
     recommended_payout = round(net_estimate * final_ratio, 2)
+
+    # If identity proof is invalid, suggested payout is 0.0
+    if has_id_doc and not id_verified_flag:
+        final_ratio = 0.0
+        recommended_payout = 0.0
 
     result = {
         "agent": "A5_Fraud_Risk_Scoring",

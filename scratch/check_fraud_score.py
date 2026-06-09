@@ -21,6 +21,21 @@ def check_fraud():
             print(f"Agent Reasoning: {frs.agent_reasoning}")
         else:
             print("No fraud risk score record found.")
+            
+        from app.models.models import PipelineTrace
+        trace = db.query(PipelineTrace).filter(PipelineTrace.claim_id == claim.id).first()
+        if trace:
+            print(f"--- Pipeline Trace details ---")
+            print(f"Outcome: {trace.outcome}")
+            print(f"Outcome Msg: {trace.outcome_msg}")
+            if trace.trace:
+                for step in trace.trace:
+                    if step.get("step") == "A5_Fraud_Risk_Scoring":
+                        print(f"A5 Result: {step.get('result')}")
+                    if step.get("step") == "A6_Settlement":
+                        print(f"A6 Result: {step.get('result')}")
+        else:
+            print("No pipeline trace found.")
     finally:
         db.close()
 
