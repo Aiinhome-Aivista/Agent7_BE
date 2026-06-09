@@ -341,11 +341,59 @@ async def rag_chat_response(
             context = "No relevant information found in the knowledge base."
             sources = []
 
+        # --- DB Claim Status Lookup ---
+        import re
+        claim_numbers = re.findall(r"CLM-\d{4}-\d{4}", query, re.IGNORECASE)
+        db_context = ""
+        if claim_numbers:
+            from app.models.models import Claim as DBClaim, Policy as DBPolicy, FraudRiskScore as DBFraudScore, Settlement as DBSettlement
+            for cn in claim_numbers:
+                c = db.query(DBClaim).filter(DBClaim.claim_number.ilike(cn.strip())).first()
+                if c:
+                    # Policyholders can only view their own claims
+                    if current_user.role == "policyholder" and c.claimant_id != current_user.id:
+                        continue
+                    
+                    policy = db.query(DBPolicy).filter(DBPolicy.id == c.policy_id).first()
+                    fraud = db.query(DBFraudScore).filter(DBFraudScore.claim_id == c.id).first()
+                    settlement = db.query(DBSettlement).filter(DBSettlement.claim_id == c.id).first()
+                    
+                    db_context += f"\n\n--- DATABASE RECORD FOR CLAIM {c.claim_number} ---\n"
+                    db_context += f"Claim ID: {c.id}\n"
+                    db_context += f"Claim Type: {c.claim_type}\n"
+                    db_context += f"Current Status: {c.status}\n"
+                    db_context += f"Incident Date: {c.incident_date}\n"
+                    db_context += f"Incident Description: {c.incident_description}\n"
+                    
+                    if policy:
+                        db_context += f"Policy Details: Number {policy.policy_number}, Holder: {policy.policyholder_name}\n"
+                    
+                    if c.status == "rejected":
+                        db_context += f"Rejection Notes / Adjuster Recommendation: {c.adjuster_recommended_notes or 'No rejection notes provided.'}\n"
+                    elif c.status == "settled" and settlement:
+                        db_context += f"Settlement Details: Net payout ₹{settlement.net_payout:,.2f}, Reference {settlement.payment_reference}, Settled at {settlement.settled_at}\n"
+                    
+                    if fraud:
+                        db_context += f"Fraud Risk Evaluation: Score {fraud.fraud_score}, Risk Level {fraud.risk_level}, Red flags {fraud.red_flags}\n"
+
+                    sources.append({
+                        "filename": f"Database: Claim {c.claim_number}",
+                        "section": f"Claim Status: {c.status.replace('_', ' ').title()}",
+                        "page": None,
+                        "distance": 0.0
+                    })
+
+        if db_context:
+            if context == "No relevant information found in the knowledge base.":
+                context = db_context
+            else:
+                context += db_context
+
         # 6. Construct system prompt for Mistral LLM
         system_prompt = f"""You are an expert Insurance Policy Advisor and Claims Assistant.
-Use ONLY the retrieved document excerpts to answer the user's question accurately and helpfully.
+Use the retrieved document excerpts and database records below to answer the user's question accurately and helpfully.
 
-If the answer is not explicitly present in the retrieved context, clearly state:
+If the answer is not explicitly present in the retrieved context or database records, clearly state:
 "I could not find this specific information in the uploaded policy documents."
 
 Provide:
@@ -357,7 +405,7 @@ Provide:
 
 User Query: {query}
 
-Context from Policy Documents:
+Context from Policy Documents and Database Records:
 {context}
 
 Answer:"""
