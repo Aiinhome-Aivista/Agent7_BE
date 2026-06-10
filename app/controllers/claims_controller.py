@@ -84,6 +84,12 @@ class ClaimDecisionOut(BaseModel):
     message: str
 
 
+class PartialRecommendationResponse(BaseModel):
+    recommended_percentage: float
+    recommended_amount: float
+    explanation: str
+
+
 # ── Helper ────────────────────────────────────────────────────
 def _next_bday(dt: datetime, n: int) -> datetime:
     d, c = dt, 0
@@ -368,6 +374,143 @@ def get_claim(
         raise HTTPException(status_code=404, detail="Claim not found")
     return _prepare_claim_out(db, claim)
 
+
+@router.post("/{claim_id}/recommend-partial", response_model=PartialRecommendationResponse)
+def get_partial_recommendation(
+    claim_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Generate partial settlement recommendation using LLM."""
+    ALLOWED = {"adjuster", "siu_investigator", "supervisor", "admin"}
+    if current_user.role not in ALLOWED:
+        raise HTTPException(403, "Only adjuster / SIU / supervisor can request recommendations")
+
+    claim = db.query(Claim).filter(Claim.id == claim_id).first()
+    if not claim:
+        raise HTTPException(404, "Claim not found")
+
+    # Check for identity document verification failure
+    from app.models.models import ClaimDocument
+    id_docs = db.query(ClaimDocument).filter(
+        ClaimDocument.claim_id == claim_id,
+        ClaimDocument.category == "id_card"
+    ).order_by(ClaimDocument.id.desc()).all()
+    
+    id_verified_flag = True
+    has_id_doc = False
+
+    if id_docs:
+        has_id_doc = True
+        latest_doc = id_docs[0]
+        ext_data = latest_doc.extracted_data or {}
+        if ext_data and not ext_data.get("id_verified", True):
+            id_verified_flag = False
+
+    if has_id_doc and not id_verified_flag:
+        return PartialRecommendationResponse(
+            recommended_percentage=0.0,
+            recommended_amount=0.0,
+            explanation="Identity verification failed. Recommended payout is ₹0.00 until a valid identity document is uploaded and verified."
+        )
+
+    # Get pipeline trace to get damage assessment and fraud details
+    from app.models.models import PipelineTrace, FraudRiskScore
+    trace_rec = db.query(PipelineTrace).filter(PipelineTrace.claim_id == claim_id).first()
+    
+    policy = db.query(Policy).filter(Policy.id == claim.policy_id).first()
+    coverage_limit = float(policy.coverage_limit or 999999.0) if policy else 999999.0
+    net_estimate = 0.0
+    fraud_score = 0.0
+    red_flags = []
+    
+    # 1. Try to find damage assessment and fraud score from pipeline trace or models
+    if trace_rec and trace_rec.trace:
+        for step_data in trace_rec.trace:
+            if step_data.get("step") == "A4_Damage_Assessment":
+                net_estimate = step_data.get("result", {}).get("net_estimate", 0.0)
+            elif step_data.get("step") == "A5_Fraud_Risk_Scoring":
+                res = step_data.get("result", {})
+                fraud_score = res.get("fraud_score", 0.0)
+                red_flags = res.get("red_flags", [])
+
+    # If not in trace, check FraudRiskScore DB model
+    if not fraud_score or not red_flags:
+        fraud_rec = db.query(FraudRiskScore).filter(FraudRiskScore.claim_id == claim_id).first()
+        if fraud_rec:
+            fraud_score = float(fraud_rec.fraud_score or 0.0)
+            red_flags = fraud_rec.red_flags or []
+
+    # If net_estimate is 0, let's look up if there's any policy limits or other clues
+    if not net_estimate:
+        net_estimate = float(claim.policy_coverage_limit or 10000.0)
+
+    # Let's call Mistral LLM to generate the recommendation
+    from app.core.config import settings
+    import httpx
+    import json
+
+    # Default heuristic: base ratio 85% reduced by score/red_flags
+    base_ratio = 0.85
+    ratio_reduction = (fraud_score * 0.5) + (len(red_flags) * 0.05)
+    final_ratio = max(0.10, base_ratio - ratio_reduction)
+    recommended_percentage = round(final_ratio * 100.0, 2)
+    explanation = f"Partial approval recommended at {recommended_percentage}% based on automated risk assessment."
+    
+    if settings.MISTRAL_API_KEY:
+        prompt = f"""You are an expert Insurance Claims Adjuster. Analyze the following claim details:
+        - Claim Number: {claim.claim_number}
+        - Claim Type: {claim.claim_type}
+        - Incident Description: {claim.incident_description or 'No description'}
+        - Estimated Net Damage: ₹{net_estimate:,.2f}
+        - Coverage Limit: ₹{coverage_limit:,.2f}
+        - Fraud Risk Score: {fraud_score}
+        - Red Flags detected: {", ".join(red_flags) if red_flags else "None"}
+
+        Your goal is to suggest:
+        1. A recommended payout percentage (a value between 10.0 and 95.0) for partial approval of the claim.
+        2. A short explanation (EXACTLY 1 to 2 lines, maximum 150 characters) detailing why this partial approval amount is recommended, highlighting key issues (e.g., specific red flags, mismatch, or high value). The explanation must be professional and grammatically correct.
+
+        Return ONLY a valid JSON object:
+        {{"recommended_percentage": <float>, "explanation": "<explanation string>"}}"""
+        
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(
+                    "https://api.mistral.ai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.MISTRAL_API_KEY.strip()}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "mistral-small-latest",
+                        "response_format": {"type": "json_object"},
+                        "messages": [{"role": "user", "content": prompt}],
+                    }
+                )
+                resp.raise_for_status()
+                result_json = resp.json()
+                content = result_json["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                recommended_percentage = float(parsed.get("recommended_percentage", recommended_percentage))
+                explanation = parsed.get("explanation", explanation).strip()
+        except Exception as e:
+            # Fallback heuristic logic is already set in recommended_percentage
+            pass
+
+    # Heuristic fallback / safety clamps
+    if recommended_percentage < 10.0:
+        recommended_percentage = 10.0
+    if recommended_percentage > 95.0:
+        recommended_percentage = 95.0
+        
+    recommended_amount = round(net_estimate * (recommended_percentage / 100.0), 2)
+    
+    return PartialRecommendationResponse(
+        recommended_percentage=round(recommended_percentage, 2),
+        recommended_amount=recommended_amount,
+        explanation=explanation
+    )
 
 
 @router.post("/{claim_id}/decision", response_model=ClaimDecisionOut)
