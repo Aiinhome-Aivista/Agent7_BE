@@ -251,10 +251,11 @@ def _prepare_claim_out(db: Session, claim: Claim) -> ClaimOut:
     total_settled = float(total_settled)
     remaining_capacity = max(0.0, coverage_limit - total_settled)
     
-    # Document request history
+    # Document request and decision history
     email_logs = db.query(EmailLog).filter(
         EmailLog.claim_id == claim.id,
-        EmailLog.event_type.like("document_request_%")
+        (EmailLog.event_type.like("document_request_%") | 
+         EmailLog.event_type.in_(["manual_approve", "manual_partial_approve", "manual_reject", "adjuster_reverify_referral"]))
     ).order_by(EmailLog.created_at.asc()).all()
 
     claim_created = claim.created_at or datetime.min
@@ -275,26 +276,62 @@ def _prepare_claim_out(db: Session, claim: Claim) -> ClaimOut:
         grouped_submissions[minute_key]["filenames"].append(doc.filename)
 
     history = []
-    # Add requests to history
-    for idx, log in enumerate(email_logs):
-        # Extract cleaner request message
-        match = re.search(r'Request Details:\s*\n?\s*"(.*?)"', log.body, re.DOTALL)
-        msg = match.group(1) if match else log.body
-        
-        by_role = log.source_role or "adjuster"
-        if by_role == "system":
-            if claim.status in ("escalated_siu", "siu_escalation_limit_exceeded") or claim.assigned_siu is not None:
-                by_role = "siu_investigator"
-            else:
-                by_role = "adjuster"
+    doc_req_idx = 0
+    reaction_idx = 0
+    
+    # Process email logs
+    for log in email_logs:
+        if log.event_type.startswith("document_request_"):
+            doc_req_idx += 1
+            # Extract cleaner request message
+            match = re.search(r'Request Details:\s*\n?\s*"(.*?)"', log.body, re.DOTALL)
+            msg = match.group(1) if match else log.body
+            
+            by_role = log.source_role or "adjuster"
+            if by_role == "system":
+                if claim.status in ("escalated_siu", "siu_escalation_limit_exceeded") or claim.assigned_siu is not None:
+                    by_role = "siu_investigator"
+                else:
+                    by_role = "adjuster"
 
-        history.append({
-            "type": "request",
-            "sequence": idx + 1,
-            "date": log.created_at.isoformat() if log.created_at else None,
-            "message": msg,
-            "by": by_role
-        })
+            history.append({
+                "type": "request",
+                "sequence": doc_req_idx,
+                "date": log.created_at.isoformat() if log.created_at else None,
+                "message": msg,
+                "by": by_role
+            })
+        else:
+            reaction_idx += 1
+            # Extract trigger reason / decision notes
+            match = re.search(r'Reason:\s*(.*)', log.body, re.DOTALL)
+            msg = match.group(1).strip() if match else log.body
+            
+            label = "Review Decision"
+            if log.event_type == "adjuster_reverify_referral":
+                label = "Adjuster Referral to SIU"
+            elif log.event_type == "manual_approve":
+                label = "Claim Approved"
+            elif log.event_type == "manual_partial_approve":
+                label = "Claim Partially Approved"
+            elif log.event_type == "manual_reject":
+                label = "Claim Rejected"
+
+            by_role = log.source_role or "adjuster"
+            if by_role == "system":
+                if log.event_type == "adjuster_reverify_referral":
+                    by_role = "adjuster"
+                elif log.event_type in ("manual_approve", "manual_partial_approve", "manual_reject"):
+                    by_role = "siu_investigator"
+
+            history.append({
+                "type": "reaction",
+                "sequence": reaction_idx,
+                "date": log.created_at.isoformat() if log.created_at else None,
+                "message": msg,
+                "label": label,
+                "by": by_role
+            })
 
     # Add submissions to history
     for idx, (min_key, sub) in enumerate(sorted(grouped_submissions.items(), key=lambda x: x[0])):
@@ -400,6 +437,7 @@ def claim_decision(
             event_type="adjuster_reverify_referral",
             source_status="escalated_siu",
             trigger_reason=payload.notes or "Referred for SIU re-verification.",
+            source_role=current_user.role,
         )
 
         # Notify SIU Investigators via escalation email/notification service
@@ -487,6 +525,7 @@ def claim_decision(
                 event_type="manual_partial_approve",
                 source_status="settled",
                 trigger_reason=payload.notes or "Partially approved after manual review.",
+                source_role=current_user.role,
             )
         else:
             msg = (
@@ -505,6 +544,7 @@ def claim_decision(
                 event_type="manual_approve",
                 source_status="settled",
                 trigger_reason=payload.notes or "Approved after manual review.",
+                source_role=current_user.role,
             )
     else:
         claim.status = "rejected"
@@ -524,6 +564,7 @@ def claim_decision(
             event_type="manual_reject",
             source_status="rejected",
             trigger_reason=reason,
+            source_role=current_user.role,
         )
 
     # Notify claimant
