@@ -291,6 +291,42 @@ async def extract_claim_from_doc(
     if current_user.role != "policyholder":
         raise HTTPException(403, "Only policyholders can use this endpoint")
 
+    from app.models.models import InsuranceConfiguration, PolicyTypeMaster, LOBMaster, Policy
+    policy = db.query(Policy).filter(Policy.id == policy_id).first()
+    lob_code = (policy.policy_type or "health").upper() if policy else "HEALTH"
+    plan_code = "PREMIUM_GROUP"
+    if policy and policy.plan_name:
+        plan_code = policy.plan_name.strip().upper().replace(" ", "_")
+        
+    config = None
+    if policy:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).join(
+            LOBMaster, LOBMaster.id == InsuranceConfiguration.lob_id
+        ).filter(
+            LOBMaster.lob_code == lob_code,
+            PolicyTypeMaster.policy_code == plan_code,
+            InsuranceConfiguration.is_active == True
+        ).first()
+
+    if not config:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).filter(
+            PolicyTypeMaster.policy_code == "PREMIUM_GROUP",
+            InsuranceConfiguration.is_active == True
+        ).first()
+        
+    mandatory_categories = ["claim_form", "medical_report", "test_report", "id_card"]
+    optional_categories = ["other"]
+    if config and config.document_rules:
+        if "mandatory" in config.document_rules:
+            mandatory_categories = config.document_rules["mandatory"]
+        if "optional" in config.document_rules:
+            optional_categories = config.document_rules["optional"]
+    all_categories = list(set(mandatory_categories + optional_categories + ["other"]))
+
     uploaded_files = []
     if files:
         uploaded_files.extend(files)
@@ -374,39 +410,42 @@ async def extract_claim_from_doc(
                     {"filename": info["filename"], "category": "other", "extracted_data": {}}
                     for info in saved_files_info
                 ],
-                "missing_categories": ["claim_form", "medical_report", "test_report", "id_card"],
+                "missing_categories": mandatory_categories,
                 "raw_text": combined_text
             }
 
-        prompt = """You are a Claims Intake AI. Analyze the provided claim document context, which contains text and/or images from one or more uploaded files.
+        categories_str = ", ".join(f"'{cat}'" for cat in all_categories)
+        mandatory_str = ", ".join(f"'{cat}'" for cat in mandatory_categories)
+
+        prompt = f"""You are a Claims Intake AI. Analyze the provided claim document context, which contains text and/or images from one or more uploaded files.
 
 You must:
-1. Classify each document into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
+1. Classify each document into one of: {categories_str}.
 2. Extract key structured metadata (e.g. names, dates, amounts, ID numbers, diagnoses, doctor names) per document.
 3. Generate a unified claim summary (claim_type, incident_date, incident_description, incident_location).
-4. Identify which of the 4 essential categories are missing from the uploaded files: 'claim_form', 'medical_report', 'test_report', 'id_card'.
+4. Identify which of the essential categories are missing from the uploaded files: {mandatory_str}.
 5. For each document, transcribe all readable text from the document (especially if it was an image) and place it in the "transcribed_text" field inside that document object so we can save it for search.
 
 Return ONLY a valid JSON object matching this schema exactly:
-{
+{{
   "claim_type": "<one of: auto_accident, property_damage, theft, medical, weather, other>",
   "incident_date": "<YYYY-MM-DD format, best estimate from all documents>",
   "incident_description": "<Merged 2-4 sentence summary of what happened, diagnosis, treatments, and tests>",
   "incident_location": "<city/location if mentioned, else empty string>",
   "documents": [
-    {
+    {{
       "filename": "<filename matching one of the document names>",
-      "category": "<one of: claim_form, medical_report, test_report, id_card, other>",
+      "category": "<one of: {', '.join(all_categories)}>",
       "transcribed_text": "<Full transcribed text of this document (especially if it was an image)>",
-      "extracted_data": {
+      "extracted_data": {{
          // Key-value pairs of raw data fields captured from this file (e.g. patient_name, doctor, test_type, id_number)
-      }
-    }
+      }}
+    }}
   ],
   "missing_categories": [
-     // List of missing categories from: ["claim_form", "medical_report", "test_report", "id_card"]
+     // List of missing categories from: [{', '.join(mandatory_categories)}]
   ]
-}
+}}
 
 Rules:
 - claim_type must EXACTLY match one of the allowed values
@@ -525,7 +564,7 @@ Rules:
         for doc in documents_list:
             fname = doc.get("filename", "")
             category = doc.get("category", "other")
-            if category not in ("claim_form", "medical_report", "test_report", "id_card", "other"):
+            if category not in all_categories:
                 category = "other"
             
             ext_data = doc.get("extracted_data", {})
@@ -578,6 +617,9 @@ Rules:
         
         db.commit()
 
+        # Determine missing categories dynamically
+        uploaded_categories = [doc.get("category") for doc in extracted.get("documents", []) if doc.get("category")]
+        extracted["missing_categories"] = [cat for cat in mandatory_categories if cat not in uploaded_categories]
         extracted["extracted"] = True
         extracted["temp_file_paths"] = saved_paths
         extracted["temp_file_path"] = saved_paths[0] if saved_paths else None
@@ -629,7 +671,7 @@ Rules:
                 {"filename": info["filename"], "category": "other", "extracted_data": {}}
                 for info in saved_files_info
             ],
-            "missing_categories": ["claim_form", "medical_report", "test_report", "id_card"],
+            "missing_categories": mandatory_categories,
             "raw_text": combined_text
         }
     except Exception as e:
@@ -670,7 +712,7 @@ Rules:
                 {"filename": info["filename"], "category": "other", "extracted_data": {}}
                 for info in saved_files_info
             ],
-            "missing_categories": ["claim_form", "medical_report", "test_report", "id_card"],
+            "missing_categories": mandatory_categories,
             "raw_text": combined_text
         }
 

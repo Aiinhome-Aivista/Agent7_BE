@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     UniqueConstraint,
+    ForeignKey,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -355,4 +356,76 @@ class ClaimDocument(Base):
     raw_text = Column(Text)
     extracted_data = Column(JSON)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class LOBMaster(Base):
+    __tablename__ = "lob_master"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    lob_code = Column(String(50), unique=True, nullable=False, index=True)
+    lob_name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ProductMaster(Base):
+    __tablename__ = "product_master"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    lob_id = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("lob_master.id"), nullable=False)
+    product_code = Column(String(100), unique=True, nullable=False, index=True)
+    product_name = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True)
+    
+    lob = relationship("LOBMaster")
+
+
+class PolicyTypeMaster(Base):
+    __tablename__ = "policy_type_master"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    product_id = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("product_master.id"), nullable=False)
+    policy_code = Column(String(100), unique=True, nullable=False, index=True)
+    policy_name = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True)
+    
+    product = relationship("ProductMaster")
+
+
+class DocumentMaster(Base):
+    __tablename__ = "document_master"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    document_code = Column(String(100), unique=True, nullable=False, index=True)
+    document_name = Column(String(255), nullable=False)
+    description = Column(Text)
+    is_active = Column(Boolean, default=True)
+
+
+class FraudRuleMaster(Base):
+    __tablename__ = "fraud_rule_master"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    rule_code = Column(String(100), unique=True, nullable=False, index=True)
+    rule_name = Column(String(255), nullable=False)
+    description = Column(Text)
+    default_weightage = Column(DECIMAL(5, 2), default=0.00)
+    is_active = Column(Boolean, default=True)
+
+
+class InsuranceConfiguration(Base):
+    __tablename__ = "insurance_configurations"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, index=True)
+    lob_id = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("lob_master.id"), nullable=False)
+    product_id = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("product_master.id"), nullable=False)
+    policy_type_id = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("policy_type_master.id"), nullable=False)
+    
+    document_rules = Column(JSON, nullable=False)
+    fraud_rules = Column(JSON, nullable=False)
+    eligibility_rules = Column(JSON, nullable=False)
+    llm_rules = Column(JSON, nullable=False)
+    
+    version_no = Column(Integer, default=1)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    lob = relationship("LOBMaster")
+    product = relationship("ProductMaster")
+    policy_type = relationship("PolicyTypeMaster")
 

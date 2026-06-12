@@ -450,10 +450,43 @@ def get_partial_recommendation(
     import httpx
     import json
 
-    # Default heuristic: base ratio 85% reduced by score/red_flags
+    # Fetch active configuration for LLM rules
+    from app.models.models import InsuranceConfiguration, PolicyTypeMaster, LOBMaster
+    lob_code = (policy.policy_type or "health").upper() if policy else "HEALTH"
+    plan_code = "PREMIUM_GROUP"
+    if policy and policy.plan_name:
+        plan_code = policy.plan_name.strip().upper().replace(" ", "_")
+
+    config = None
+    if policy:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).join(
+            LOBMaster, LOBMaster.id == InsuranceConfiguration.lob_id
+        ).filter(
+            LOBMaster.lob_code == lob_code,
+            PolicyTypeMaster.policy_code == plan_code,
+            InsuranceConfiguration.is_active == True
+        ).first()
+
+    if not config:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).filter(
+            PolicyTypeMaster.policy_code == "PREMIUM_GROUP",
+            InsuranceConfiguration.is_active == True
+        ).first()
+
     base_ratio = 0.85
+    min_payout_pct = 10.0
+    max_payout_pct = 95.0
+    if config and config.llm_rules:
+        base_ratio = float(config.llm_rules.get("base_ratio", 0.85))
+        min_payout_pct = float(config.llm_rules.get("min_payout_pct", 10.0))
+        max_payout_pct = float(config.llm_rules.get("max_payout_pct", 95.0))
+
     ratio_reduction = (fraud_score * 0.5) + (len(red_flags) * 0.05)
-    final_ratio = max(0.10, base_ratio - ratio_reduction)
+    final_ratio = max(min_payout_pct / 100.0, base_ratio - ratio_reduction)
     recommended_percentage = round(final_ratio * 100.0, 2)
     explanation = f"Partial approval recommended at {recommended_percentage}% based on automated risk assessment."
     
@@ -468,7 +501,7 @@ def get_partial_recommendation(
         - Red Flags detected: {", ".join(red_flags) if red_flags else "None"}
 
         Your goal is to suggest:
-        1. A recommended payout percentage (a value between 10.0 and 95.0) for partial approval of the claim.
+        1. A recommended payout percentage (a value between {min_payout_pct} and {max_payout_pct}) for partial approval of the claim.
         2. A short explanation (EXACTLY 1 to 2 lines, maximum 150 characters) detailing why this partial approval amount is recommended, highlighting key issues (e.g., specific red flags, mismatch, or high value). The explanation must be professional and grammatically correct.
 
         Return ONLY a valid JSON object:
@@ -499,10 +532,10 @@ def get_partial_recommendation(
             pass
 
     # Heuristic fallback / safety clamps
-    if recommended_percentage < 10.0:
-        recommended_percentage = 10.0
-    if recommended_percentage > 95.0:
-        recommended_percentage = 95.0
+    if recommended_percentage < min_payout_pct:
+        recommended_percentage = min_payout_pct
+    if recommended_percentage > max_payout_pct:
+        recommended_percentage = max_payout_pct
         
     recommended_amount = round(net_estimate * (recommended_percentage / 100.0), 2)
     
@@ -978,9 +1011,45 @@ async def upload_more_documents(
     from app.controllers.fnol_controller import UPLOAD_DIR, _validate_upload
     from app.controllers.policy_controller import _extract_text
     from app.core.config import settings
+    from app.models.models import InsuranceConfiguration, PolicyTypeMaster, LOBMaster, Policy
     import uuid
     import httpx
     import json
+
+    policy = db.query(Policy).filter(Policy.id == claim.policy_id).first()
+    lob_code = (policy.policy_type or "health").upper() if policy else "HEALTH"
+    plan_code = "PREMIUM_GROUP"
+    if policy and policy.plan_name:
+        plan_code = policy.plan_name.strip().upper().replace(" ", "_")
+
+    config = None
+    if policy:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).join(
+            LOBMaster, LOBMaster.id == InsuranceConfiguration.lob_id
+        ).filter(
+            LOBMaster.lob_code == lob_code,
+            PolicyTypeMaster.policy_code == plan_code,
+            InsuranceConfiguration.is_active == True
+        ).first()
+
+    if not config:
+        config = db.query(InsuranceConfiguration).join(
+            PolicyTypeMaster, PolicyTypeMaster.id == InsuranceConfiguration.policy_type_id
+        ).filter(
+            PolicyTypeMaster.policy_code == "PREMIUM_GROUP",
+            InsuranceConfiguration.is_active == True
+        ).first()
+
+    mandatory_categories = ["claim_form", "medical_report", "test_report", "id_card"]
+    optional_categories = ["other"]
+    if config and config.document_rules:
+        if "mandatory" in config.document_rules:
+            mandatory_categories = config.document_rules["mandatory"]
+        if "optional" in config.document_rules:
+            optional_categories = config.document_rules["optional"]
+    all_categories = list(set(mandatory_categories + optional_categories + ["other"]))
 
     saved_paths = []
     combined_text = ""
@@ -1027,23 +1096,24 @@ async def upload_more_documents(
 
     if settings.MISTRAL_API_KEY:
         if has_images:
-            prompt = """You are a Claims intake helper. Given document images and text snippets:
-            1. Classify each file into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
+            categories_str = ", ".join(f"'{cat}'" for cat in all_categories)
+            prompt = f"""You are a Claims intake helper. Given document images and text snippets:
+            1. Classify each file into one of: {categories_str}.
             2. For each document, transcribe all readable text (especially if it was an image) and place it in the "transcribed_text" field.
             3. Extract key structured metadata (e.g. name, date_of_birth, patient_name, dob, validity, expiry_date) and place it in "extracted_data".
             Return ONLY a valid JSON object matching this schema exactly:
-            {
+            {{
               "documents": [
-                {
+                {{
                   "filename": "<filename>",
-                  "category": "claim_form | medical_report | test_report | id_card | other",
+                  "category": "<one of: {', '.join(all_categories)}>",
                   "transcribed_text": "...",
-                  "extracted_data": {
+                  "extracted_data": {{
                      // Key-value pairs
-                  }
-                }
+                  }}
+                }}
               ]
-            }"""
+            }}"""
             user_content = [
                 {
                     "type": "text",
@@ -1087,7 +1157,8 @@ async def upload_more_documents(
                 import logging
                 logging.getLogger(__name__).error(f"Image classification failed: {e}")
         else:
-            prompt = """You are a Claims intake helper. Given list of filenames and their snippets, classify each file into one of: 'claim_form', 'medical_report', 'test_report', 'id_card', 'other'.
+            categories_str = ", ".join(f"'{cat}'" for cat in all_categories)
+            prompt = f"""You are a Claims intake helper. Given list of filenames and their snippets, classify each file into one of: {categories_str}.
             Return JSON object with "documents": [{"filename": "...", "category": "..."}]"""
             try:
                 truncated = combined_text[:4000]
@@ -1124,7 +1195,7 @@ async def upload_more_documents(
         if "id_card" in fname_lower or "aadhaar" in fname_lower or "pan_card" in fname_lower or "identity" in fname_lower or "passport" in fname_lower:
             cat = "id_card"
 
-        if cat not in ("claim_form", "medical_report", "test_report", "id_card", "other"):
+        if cat not in all_categories:
             cat = "other"
 
         transcribed_text = transcriptions_by_filename.get(fname_lower, "")
