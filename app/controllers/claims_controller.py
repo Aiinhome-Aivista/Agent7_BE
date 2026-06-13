@@ -539,6 +539,26 @@ def get_partial_recommendation(
         
     recommended_amount = round(net_estimate * (recommended_percentage / 100.0), 2)
     
+    # Cap recommended_amount at the rule-based recommended payout from step A5
+    rec_payout = 0.0
+    if trace_rec and trace_rec.trace:
+        for step_data in trace_rec.trace:
+            if step_data.get("step") == "A5_Fraud_Risk_Scoring":
+                rec_payout = step_data.get("result", {}).get("recommended_payout", 0.0)
+                break
+    if not rec_payout:
+        if trace_rec and trace_rec.trace:
+            for step_data in trace_rec.trace:
+                if step_data.get("step") == "A4_Damage_Assessment":
+                    rec_payout = step_data.get("result", {}).get("net_estimate", 0.0)
+                    break
+
+    if rec_payout > 0.0:
+        if recommended_amount > rec_payout:
+            recommended_amount = rec_payout
+            if net_estimate > 0.0:
+                recommended_percentage = round((recommended_amount / net_estimate) * 100.0, 2)
+    
     return PartialRecommendationResponse(
         recommended_percentage=round(recommended_percentage, 2),
         recommended_amount=recommended_amount,
@@ -577,6 +597,28 @@ def claim_decision(
     if payload.action == "partial_approve":
         if payload.amount is None or payload.amount <= 0:
             raise HTTPException(400, "For partial approval, a positive amount must be specified")
+        
+        # Enforce that partial approval amount cannot exceed the rule-based recommended payout
+        from app.models.models import PipelineTrace
+        trace_rec = db.query(PipelineTrace).filter(PipelineTrace.claim_id == claim_id).first()
+        rec_payout = 0.0
+        if trace_rec and trace_rec.trace:
+            for step_data in trace_rec.trace:
+                if step_data.get("step") == "A5_Fraud_Risk_Scoring":
+                    rec_payout = step_data.get("result", {}).get("recommended_payout", 0.0)
+                    break
+        if not rec_payout:
+            if trace_rec and trace_rec.trace:
+                for step_data in trace_rec.trace:
+                    if step_data.get("step") == "A4_Damage_Assessment":
+                        rec_payout = step_data.get("result", {}).get("net_estimate", 0.0)
+                        break
+        
+        if rec_payout > 0.0 and float(payload.amount) > float(rec_payout):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Partial approval amount (₹{payload.amount:,.2f}) cannot exceed the rule-based recommended payout (₹{rec_payout:,.2f})."
+            )
 
     # Enforce role-based status constraints
     if current_user.role == "adjuster" and claim.status != "escalated_adjuster":
