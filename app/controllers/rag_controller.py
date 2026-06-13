@@ -40,6 +40,7 @@ class RAGQueryResponse(BaseModel):
     confidence: float
     retrieved_chunks: int
     session_id: Optional[int] = None  # returned so UI knows which session was used
+    action: Optional[str] = None
 
 
 class SessionOut(BaseModel):
@@ -300,6 +301,37 @@ async def rag_chat_response(
             ).fetchone()
             session_id = row[0]
 
+        # 2.5 Intercept claim filing intents (always in English)
+        claim_intents = [
+            "file a claim", "file new claim", "initiate claim", "register claim", 
+            "create claim", "submit claim", "record fnol", "claim creation"
+        ]
+        if any(intent in query.lower() for intent in claim_intents):
+            answer = "Sure! I can help you file a new claim. Please select your policy and upload the required documents below to begin."
+            db.execute(
+                text(
+                    "INSERT INTO chat_messages (session_id, sender, message) "
+                    "VALUES (:sid, 'user', :msg)"
+                ),
+                {"sid": session_id, "msg": query},
+            )
+            db.execute(
+                text(
+                    "INSERT INTO chat_messages (session_id, sender, message) "
+                    "VALUES (:sid, 'agent', :msg)"
+                ),
+                {"sid": session_id, "msg": answer},
+            )
+            db.commit()
+            return RAGQueryResponse(
+                answer=answer,
+                sources=[],
+                confidence=1.0,
+                retrieved_chunks=0,
+                session_id=session_id,
+                action="initiate_claim"
+            )
+
         # 3. Check if Mistral API key is configured
         if not settings.MISTRAL_API_KEY:
             return RAGQueryResponse(
@@ -346,7 +378,7 @@ async def rag_chat_response(
         claim_numbers = re.findall(r"CLM-\d{4}-\d{4}", query, re.IGNORECASE)
         db_context = ""
         if claim_numbers:
-            from app.models.models import Claim as DBClaim, Policy as DBPolicy, FraudRiskScore as DBFraudScore, Settlement as DBSettlement
+            from app.models.models import Claim as DBClaim, Policy as DBPolicy, FraudRiskScore as DBFraudScore, Settlement as DBSettlement, ClaimDocument as DBClaimDoc
             for cn in claim_numbers:
                 c = db.query(DBClaim).filter(DBClaim.claim_number.ilike(cn.strip())).first()
                 if c:
@@ -357,6 +389,7 @@ async def rag_chat_response(
                     policy = db.query(DBPolicy).filter(DBPolicy.id == c.policy_id).first()
                     fraud = db.query(DBFraudScore).filter(DBFraudScore.claim_id == c.id).first()
                     settlement = db.query(DBSettlement).filter(DBSettlement.claim_id == c.id).first()
+                    docs = db.query(DBClaimDoc).filter(DBClaimDoc.claim_id == c.id).all()
                     
                     db_context += f"\n\n--- DATABASE RECORD FOR CLAIM {c.claim_number} ---\n"
                     db_context += f"Claim ID: {c.id}\n"
@@ -367,6 +400,11 @@ async def rag_chat_response(
                     
                     if policy:
                         db_context += f"Policy Details: Number {policy.policy_number}, Holder: {policy.policyholder_name}\n"
+                    
+                    if docs:
+                        db_context += "Uploaded Claim Documents:\n"
+                        for doc in docs:
+                            db_context += f"- Filename: {doc.filename}, Category: {doc.category}\n"
                     
                     if c.status == "rejected":
                         db_context += f"Rejection Notes / Adjuster Recommendation: {c.adjuster_recommended_notes or 'No rejection notes provided.'}\n"
@@ -393,6 +431,8 @@ async def rag_chat_response(
         system_prompt = f"""You are an expert Insurance Policy Advisor and Claims Assistant.
 Use the retrieved document excerpts and database records below to answer the user's question accurately and helpfully.
 
+CRITICAL: When mentioning any Claim Number (e.g., CLM-YYYY-XXXX), you MUST format it as a markdown link using its Database Claim ID (from the records below), including the helper text, exactly like this: [CLM-YYYY-XXXX (Click to view details)](/dashboard/claims/ID).
+
 If the answer is not explicitly present in the retrieved context or database records, clearly state:
 "I could not find this specific information in the uploaded policy documents."
 
@@ -401,7 +441,8 @@ Provide:
 2. Coverage details and any exclusions if relevant.
 3. Benefits and limitations if relevant.
 4. Clear source references (document name, section).
-5. Your confidence level (High, Medium, Low) based on document clarity.
+
+Do NOT include any confidence levels (e.g., "Confidence Level: High") in your response.
 
 User Query: {query}
 
