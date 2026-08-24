@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: aiinhome-aivista/agent_7_fe
-  CONTAINER_NAME: agent-7-fe
+  IMAGE_NAME: aiinhome-aivista/agent_7_be
+  CONTAINER_NAME: agent-7-be
   PORT: 3032
 
 jobs:
