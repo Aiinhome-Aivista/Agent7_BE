@@ -268,7 +268,7 @@ USER CUSTOM PROMPT (APPLY THESE RULES IF GIVEN):
                 "https://api.mistral.ai/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "mistral-small-latest",
+                    "model": "mistral-small-24b",
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": summary_prompt},
@@ -289,7 +289,7 @@ USER CUSTOM PROMPT (APPLY THESE RULES IF GIVEN):
                 "https://api.mistral.ai/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "mistral-small-latest",
+                    "model": "mistral-small-24b",
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": graph_prompt},
@@ -594,7 +594,7 @@ DOCUMENT CONTEXT:
                 "Accept": "application/json",
             }
             payload = {
-                "model": "mistral-small-latest",
+                "model": "mistral-small-24b",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": query},

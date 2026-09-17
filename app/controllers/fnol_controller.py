@@ -478,7 +478,7 @@ Rules:
             }
         else:
             payload_json = {
-                "model": "mistral-small-latest",
+                "model": "mistral-small-24b",
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": prompt},
@@ -519,7 +519,7 @@ Rules:
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "mistral-small-latest",
+                        "model": "mistral-small-24b",
                         "response_format": {"type": "json_object"},
                         "messages": [
                             {"role": "system", "content": prompt},

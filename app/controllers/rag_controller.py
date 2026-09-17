@@ -77,7 +77,7 @@ async def _call_mistral_api(prompt: str) -> Dict[str, Any]:
                 "https://api.mistral.ai/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "mistral-small-latest",
+                    "model": "mistral-small-24b",
                     "messages": [{"role": "system", "content": prompt}],
                 },
             )
@@ -90,6 +90,18 @@ async def _call_mistral_api(prompt: str) -> Dict[str, Any]:
                 .get("message", {})
                 .get("content", "No answer provided.")
             )
+            
+            # Extract and print token usage
+            usage = response_data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", 0)
+            
+            print(f"=========================================")
+            print(f"Token Usage - Input: {prompt_tokens}, Output: {completion_tokens}, Total: {total_tokens}")
+            print(f"=========================================")
+            
+            logger.info(f"Token Usage - Input: {prompt_tokens}, Output: {completion_tokens}, Total: {total_tokens}")
 
             return {
                 "answer": answer,

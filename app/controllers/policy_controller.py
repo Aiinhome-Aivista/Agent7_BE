@@ -981,7 +981,7 @@ POLICY TEXT:
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": "mistral-small-latest",
+                "model": "mistral-small-24b",
                 "messages": [
                     {"role": "system", "content": "You are a specialized document extraction service that only returns pure JSON matching the requested schema."},
                     {"role": "user", "content": prompt}

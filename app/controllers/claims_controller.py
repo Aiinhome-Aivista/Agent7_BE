@@ -134,7 +134,7 @@ def verify_identity_document(db: Session, doc: ClaimDocument, policy_id: int, us
                             "Content-Type": "application/json",
                         },
                         json={
-                            "model": "mistral-small-latest",
+                            "model": "mistral-small-24b",
                             "response_format": {"type": "json_object"},
                             "messages": [
                                 {"role": "system", "content": prompt},
@@ -516,7 +516,7 @@ def get_partial_recommendation(
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "mistral-small-latest",
+                        "model": "mistral-small-24b",
                         "response_format": {"type": "json_object"},
                         "messages": [{"role": "user", "content": prompt}],
                     }
@@ -1212,7 +1212,7 @@ async def upload_more_documents(
                             "Content-Type": "application/json",
                         },
                         json={
-                            "model": "mistral-small-latest",
+                            "model": "mistral-small-24b",
                             "response_format": {"type": "json_object"},
                             "messages": [
                                 {"role": "system", "content": prompt},
